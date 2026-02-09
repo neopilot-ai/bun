@@ -1,0 +1,155 @@
+name: build-release
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Override version (leave empty to use LATEST-neocode)"
+        required: false
+        type: string
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: LATEST
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            BASE=$(cat LATEST | tr -d '[:space:]')
+            TIMESTAMP=$(date +%Y%m%d%H%M%S)
+            echo "version=${BASE}-neocode.${TIMESTAMP}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Print version
+        run: echo "Building version ${{ steps.version.outputs.version }}"
+
+  build-windows:
+    needs: version
+    runs-on: blacksmith-8vcpu-windows-2025
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # Blacksmith Windows 2025 has: CMake, Go, Python, Ruby, Perl, Node, Git, Rust, LLVM 20
+      # We install: VS Community (for ATL/NativeDesktop), LLVM 21, nasm, ccache, ninja, mingw
+      - name: Install LLVM 21
+        run: |
+          choco install llvm --yes --accept-license --no-progress --force --version=21.1.8
+          echo "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      # Blacksmith has VS Build Tools but without NativeDesktop workload (no ATL).
+      # Add NativeDesktop + recommended components (includes ATL) to existing Build Tools.
+      - name: Add NativeDesktop workload to Build Tools
+        run: |
+          # Kill any lingering VS installer processes
+          Get-Process -Name "setup","vs_installer" -ErrorAction SilentlyContinue | Stop-Process -Force
+          Start-Sleep -Seconds 5
+          $bootstrapper = "$env:TEMP\vs_buildtools.exe"
+          Write-Output "Downloading VS BuildTools bootstrapper..."
+          Invoke-WebRequest -Uri "https://aka.ms/vs/17/release/vs_buildtools.exe" -OutFile $bootstrapper
+          Write-Output "Adding NativeDesktop workload to existing Build Tools..."
+          $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+          $startInfo.FileName = $bootstrapper
+          $startInfo.Arguments = "modify --installPath ""C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"" --add Microsoft.VisualStudio.Workload.NativeDesktop --add Microsoft.VisualStudio.Component.VC.ATL --includeRecommended --quiet --norestart --wait --force"
+          $startInfo.CreateNoWindow = $true
+          $process = New-Object System.Diagnostics.Process
+          $process.StartInfo = $startInfo
+          $process.Start() | Out-Null
+          $process.WaitForExit()
+          $exitCode = $process.ExitCode
+          Write-Output "VS installer exit code: $exitCode"
+          # 0 = success, 3010 = success but reboot needed
+          if ($exitCode -ne 0 -and $exitCode -ne 3010) {
+            Write-Error "Failed to add NativeDesktop workload (exit code $exitCode)"
+            exit 1
+          }
+          # Verify ATL headers exist
+          $msvcBase = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC"
+          $msvcVer = (Get-ChildItem $msvcBase | Sort-Object Name -Descending | Select-Object -First 1).Name
+          $atlPath = "$msvcBase\$msvcVer\atlmfc\include\atlstr.h"
+          if (Test-Path $atlPath) {
+            Write-Output "ATL verified: $atlPath"
+          } else {
+            Write-Error "ATL headers not found after installation"
+            exit 1
+          }
+        shell: pwsh
+
+      - name: Install build tools
+        run: choco install nasm ccache ninja mingw --yes --accept-license --no-progress --force
+
+      - name: Verify toolchain
+        run: |
+          clang-cl --version
+          cmake --version
+          cargo --version
+          ninja --version
+
+      # Build modern variant
+      - name: Build release (modern)
+        run: bun run build:release
+        env:
+          CFLAGS: -w
+          CXXFLAGS: -w
+          RUSTFLAGS: -Awarnings
+
+      - name: Package modern
+        shell: bash
+        run: |
+          mkdir -p bun-windows-x64-pkg/package/bin
+          cp build/release/bun.exe bun-windows-x64-pkg/package/bin/bun.exe
+          tar -czf bun-windows-x64.tgz -C bun-windows-x64-pkg package
+
+      # Build baseline variant (reuses same bootstrapped env)
+      - name: Build release (baseline)
+        run: bun run build:release --toolchain windows-x64-baseline
+        env:
+          CFLAGS: -w
+          CXXFLAGS: -w
+          RUSTFLAGS: -Awarnings
+
+      - name: Package baseline
+        shell: bash
+        run: |
+          mkdir -p bun-windows-x64-baseline-pkg/package/bin
+          cp build/release/bun.exe bun-windows-x64-baseline-pkg/package/bin/bun.exe
+          tar -czf bun-windows-x64-baseline.tgz -C bun-windows-x64-baseline-pkg package
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bun-windows
+          path: |
+            bun-windows-x64.tgz
+            bun-windows-x64-baseline.tgz
+
+  release:
+    needs: [version, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+
+      - name: Upload to GitHub Release
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          TAG="v${VERSION}"
+          gh release create "$TAG" --prerelease --title "bun $VERSION" \
+            --notes "Fork build $VERSION" --repo ${{ github.repository }} 2>/dev/null || true
+          gh release upload "$TAG" \
+            bun-windows/bun-windows-x64.tgz \
+            bun-windows/bun-windows-x64-baseline.tgz \
+            --clobber --repo ${{ github.repository }}
+        env:
+          GH_TOKEN: ${{ github.token }}
